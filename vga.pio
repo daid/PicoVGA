@@ -1,0 +1,85 @@
+.define public VGA_FPS         60
+.define public VGA_VLINES      480
+.define public VGA_VSYNC_FRONT 11 
+.define public VGA_VSYNC_PULSE 2
+.define public VGA_VSYNC_BACK  31
+.define public VGA_VCLOCKS     (VGA_VLINES + VGA_VSYNC_FRONT + VGA_VSYNC_PULSE + VGA_VSYNC_BACK)
+
+.define public VGA_SUBPIXEL    2
+.define public VGA_HPIXELS     640 / VGA_SUBPIXEL
+.define public VGA_HSYNC_FRONT 16 / VGA_SUBPIXEL
+.define public VGA_HSYNC_PULSE 96 / VGA_SUBPIXEL
+.define public VGA_HSYNC_BACK  48 / VGA_SUBPIXEL
+.define public VGA_HCLOCKS     (VGA_HPIXELS + VGA_HSYNC_FRONT + VGA_HSYNC_PULSE + VGA_HSYNC_BACK)
+
+.define public VGA_IRQ_VBLANK             0
+.define public VGA_IRQ_START_LINE         4
+.define public VGA_IRQ_START_PIXELS       5
+
+.program vga_vsync
+    pull block
+    out  y, 32
+.wrap_target
+    set pins, 1  [VGA_VSYNC_FRONT * 2 - 1]
+    set pins, 0  [VGA_VSYNC_PULSE * 2 - 1]
+    set pins, 1  [VGA_VSYNC_BACK - 1]
+    mov x, y     [VGA_VSYNC_BACK - 1]
+loop:
+    irq clear VGA_IRQ_START_LINE
+    jmp x-- loop
+    irq VGA_IRQ_VBLANK
+.wrap
+
+% c-sdk {
+void vga_vsync_program_init(PIO pio, uint sm, uint offset, uint pin) {
+   pio_gpio_init(pio, pin);
+   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+   pio_sm_config c = vga_vsync_program_get_default_config(offset);
+   sm_config_set_set_pins(&c, pin, 1);
+   sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / (VGA_FPS * 2 * VGA_VCLOCKS)); // We need two opcodes per line.
+   pio_sm_init(pio, sm, offset, &c);
+   pio->txf[sm] = VGA_VLINES - 1;
+}
+%}
+
+.program vga_hsync
+.wrap_target
+    irq wait VGA_IRQ_START_LINE  [VGA_HSYNC_FRONT / 8 - 1]
+    set pins 0                   [VGA_HSYNC_PULSE / 8 - 1]
+    set pins 1                   [VGA_HSYNC_BACK / 8 - 1]
+    irq clear VGA_IRQ_START_PIXELS
+.wrap
+
+% c-sdk {
+void vga_hsync_program_init(PIO pio, uint sm, uint offset, uint pin) {
+   pio_gpio_init(pio, pin);
+   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+   pio_sm_config c = vga_hsync_program_get_default_config(offset);
+   sm_config_set_set_pins(&c, pin, 1);
+   sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / (VGA_FPS * VGA_VCLOCKS * VGA_HCLOCKS / 8)); //We need 1 opcode every 8 pixel clocks.
+   pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+.program vga_hpixels
+    set  pins, 0
+    irq  wait VGA_IRQ_START_PIXELS
+.wrap_target
+    out  pins, 6
+.wrap
+
+% c-sdk {
+void vga_hpixels_program_init(PIO pio, uint sm, uint offset, uint pin) {
+   pio_gpio_init(pio, pin);
+   pio_sm_set_consecutive_pindirs(pio, sm, pin, 6, true);
+   pio_sm_config c = vga_hpixels_program_get_default_config(offset);
+   sm_config_set_set_pins(&c, pin, 6);
+   // We use one opcode per pixel clock. We don't want any fractional part, as that would give jitter in the pixel clock.
+   // This results in a 125Mhz/9 clock. We rather be slightly too fast then too slow here, as we don't
+   //  want run faster then the line clock.
+   sm_config_set_clkdiv_int_frac(&c, clock_get_hz(clk_sys) / (VGA_FPS * VGA_VCLOCKS * VGA_HCLOCKS), 0);
+   sm_config_set_out_shift(&c, false, true, 6);
+   sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+   pio_sm_init(pio, sm, offset, &c);
+}
+%}
