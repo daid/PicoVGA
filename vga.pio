@@ -1,85 +1,100 @@
-.define public VGA_FPS         60
-.define public VGA_VLINES      480
-.define public VGA_VSYNC_FRONT 11 
-.define public VGA_VSYNC_PULSE 2
-.define public VGA_VSYNC_BACK  31
-.define public VGA_VCLOCKS     (VGA_VLINES + VGA_VSYNC_FRONT + VGA_VSYNC_PULSE + VGA_VSYNC_BACK)
+.define public VGA_PIXELS 240
+.define public VGA_BUFFER_SIZE VGA_PIXELS + 2
+.define public VGA_PIXCLOCK_DIV 5
+.define public VGA_IRQ_START_LINE 5
 
-.define public VGA_SUBPIXEL    2
-.define public VGA_HPIXELS     640 / VGA_SUBPIXEL
-.define public VGA_HSYNC_FRONT 16 / VGA_SUBPIXEL
-.define public VGA_HSYNC_PULSE 96 / VGA_SUBPIXEL
-.define public VGA_HSYNC_BACK  48 / VGA_SUBPIXEL
-.define public VGA_HCLOCKS     (VGA_HPIXELS + VGA_HSYNC_FRONT + VGA_HSYNC_PULSE + VGA_HSYNC_BACK)
+.define public VGA_VIDEO_LINE_COUNT 480
+.define public VGA_FRONT_LINE_COUNT 11
+.define public VGA_SYNC_LINE_COUNT 2
+.define public VGA_BACK_LINE_COUNT 31
+.define public VGA_TOTAL_LINE_COUNT (VGA_VIDEO_LINE_COUNT + VGA_FRONT_LINE_COUNT + VGA_SYNC_LINE_COUNT + VGA_BACK_LINE_COUNT)
 
-.define public VGA_IRQ_VBLANK             0
-.define public VGA_IRQ_START_LINE         4
-.define public VGA_IRQ_START_PIXELS       5
-
-.program vga_vsync
-    pull block
-    out  y, 32
+; vga sync, generates HSYNC and VSYNC signals.
+; We always can generate HSYNC, so that's generated with SET instructions
+; We conditionally want to generate VSYNC, so that we let depend on an input word.
+; We supply 1 bit input to indicate vsync or not.
+; A full line is:
+;  640: pixels
+;  16: front
+;  96: hsync
+;  48: back
+; This PIO program runs at PCLOCK/16, this allows all above times with simple delays.
+.program vga_sync
 .wrap_target
-    set pins, 1  [VGA_VSYNC_FRONT * 2 - 1]
-    set pins, 0  [VGA_VSYNC_PULSE * 2 - 1]
-    set pins, 1  [VGA_VSYNC_BACK - 1]
-    mov x, y     [VGA_VSYNC_BACK - 1]
-loop:
-    irq clear VGA_IRQ_START_LINE
-    jmp x-- loop
-    irq VGA_IRQ_VBLANK
+    out pins 1      ; set VSYNC if required
+    ; [delay=1]
+    set pins 0  [5] ; assert HSYNC (always)
+    ; [delay=6]
+    set pins 1  [2] ; release HSYNC (always)
+    ; [delay=2]
+    irq clear VGA_IRQ_START_LINE [20] ; signal the pixel generator (one cycle early)
+    nop [19]
+    ; [delay=41]
 .wrap
 
 % c-sdk {
-void vga_vsync_program_init(PIO pio, uint sm, uint offset, uint pin) {
-   pio_gpio_init(pio, pin);
-   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
-   pio_sm_config c = vga_vsync_program_get_default_config(offset);
-   sm_config_set_set_pins(&c, pin, 1);
-   sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / (VGA_FPS * 2 * VGA_VCLOCKS)); // We need two opcodes per line.
-   pio_sm_init(pio, sm, offset, &c);
-   pio->txf[sm] = VGA_VLINES - 1;
+void vga_sync_program_init(PIO pio, uint sm, uint offset, uint vsync_pin, uint hsync_pin) {
+    pio_gpio_init(pio, vsync_pin);
+    pio_gpio_init(pio, hsync_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, vsync_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, hsync_pin, 1, true);
+    pio_sm_config c = vga_sync_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, hsync_pin, 1);
+    sm_config_set_out_pins(&c, vsync_pin, 1);
+    sm_config_set_clkdiv_int_frac(&c, VGA_PIXCLOCK_DIV * 16, 0);
+    sm_config_set_out_shift(&c, false, true, 1);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    pio_sm_init(pio, sm, offset, &c);
 }
 %}
 
-.program vga_hsync
+; pixel generator, 
+; There are 4 types of lines: (all lines always assert hsync at the right time)
+;  vsync line: during the whole line, vsync is asserted (low)
+;  inactive line: during the whole line, color lines are black (same as vsync line)
+;  static line: all pixels have the same color, after that black
+;  pixel line: 40 static pixels, 240 dynamic pixels, 40 static pixels, black
+; We run a PCLOCK, and generate 1 pixel per two cycles. Allowing for 320 pixels per line.
+.program vga_pixel
+    out y 8 ; Get the value 240 into y. We never change it after this.
 .wrap_target
-    irq wait VGA_IRQ_START_LINE  [VGA_HSYNC_FRONT / 8 - 1]
-    set pins 0                   [VGA_HSYNC_PULSE / 8 - 1]
-    set pins 1                   [VGA_HSYNC_BACK / 8 - 1]
-    irq clear VGA_IRQ_START_PIXELS
+done:
+    irq wait VGA_IRQ_START_LINE ; wait from a signal from the sync generator.
+    ; [delay=0]
+    out x 2 ; get the type of line.
+    jmp x-- skip  [13]
+    ; [delay=15] ; We get signaled 15 cycles to early, so we need to delay to sync up.
+
+    out pins 6  [31]; write the pins for the first 40 pixels
+    nop         [31]
+    mov x y     [15] ; get the value 240 into x, we write 241 pixels, last pixel should be the value for the last 40 pixels.
+    ; [delay=80]
+pixelLoop:
+    out pins 8 ; write a pixel
+    jmp x-- pixelLoop
+    
+    ; We get here with the first pixel of the trailing static pixels written, so just delay and clear the pixels.
+    nop [31]
+    nop [31]
+    nop [13]
+    ; [delay=78]
+    mov pins null ; goto black.
 .wrap
+skip:
+    out null 6
+    jmp done
 
 % c-sdk {
-void vga_hsync_program_init(PIO pio, uint sm, uint offset, uint pin) {
-   pio_gpio_init(pio, pin);
-   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
-   pio_sm_config c = vga_hsync_program_get_default_config(offset);
-   sm_config_set_set_pins(&c, pin, 1);
-   sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / (VGA_FPS * VGA_VCLOCKS * VGA_HCLOCKS / 8)); //We need 1 opcode every 8 pixel clocks.
-   pio_sm_init(pio, sm, offset, &c);
-}
-%}
-
-.program vga_hpixels
-    set  pins, 0
-    irq  wait VGA_IRQ_START_PIXELS
-.wrap_target
-    out  pins, 6
-.wrap
-
-% c-sdk {
-void vga_hpixels_program_init(PIO pio, uint sm, uint offset, uint pin) {
-   pio_gpio_init(pio, pin);
-   pio_sm_set_consecutive_pindirs(pio, sm, pin, 6, true);
-   pio_sm_config c = vga_hpixels_program_get_default_config(offset);
-   sm_config_set_set_pins(&c, pin, 6);
-   // We use one opcode per pixel clock. We don't want any fractional part, as that would give jitter in the pixel clock.
-   // This results in a 125Mhz/9 clock. We rather be slightly too fast then too slow here, as we don't
-   //  want run faster then the line clock.
-   sm_config_set_clkdiv_int_frac(&c, clock_get_hz(clk_sys) / (VGA_FPS * VGA_VCLOCKS * VGA_HCLOCKS), 0);
-   sm_config_set_out_shift(&c, false, true, 6);
-   sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-   pio_sm_init(pio, sm, offset, &c);
+void vga_pixel_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    for(uint n=0; n<6; n++)
+        pio_gpio_init(pio, pin + n);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 6, true);
+    pio_sm_config c = vga_pixel_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin, 6);
+    sm_config_set_clkdiv_int_frac(&c, VGA_PIXCLOCK_DIV, 0);
+    sm_config_set_out_shift(&c, false, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    pio_sm_init(pio, sm, offset, &c);
+    pio->txf[sm] = VGA_PIXELS;
 }
 %}
