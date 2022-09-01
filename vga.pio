@@ -1,5 +1,5 @@
 .define public VGA_PIXELS 240
-.define public VGA_BUFFER_SIZE VGA_PIXELS + 2
+.define public VGA_BUFFER_SIZE VGA_PIXELS + 3
 .define public VGA_PIXCLOCK_DIV 5
 .define public VGA_IRQ_START_LINE 5
 
@@ -12,89 +12,96 @@
 ; vga sync, generates HSYNC and VSYNC signals.
 ; We always can generate HSYNC, so that's generated with SET instructions
 ; We conditionally want to generate VSYNC, so that we let depend on an input word.
-; We supply 1 bit input to indicate vsync or not.
+
 ; A full line is:
 ;  640: pixels
 ;  16: front
 ;  96: hsync
 ;  48: back
-; This PIO program runs at PCLOCK/16, this allows all above times with simple delays.
-.program vga_sync
-.wrap_target
-    out pins 1      ; set VSYNC if required
-    ; [delay=1]
-    set pins 0  [5] ; assert HSYNC (always)
-    ; [delay=6]
-    set pins 1  [2] ; release HSYNC (always)
-    ; [delay=2]
-    irq clear VGA_IRQ_START_LINE [20] ; signal the pixel generator (one cycle early)
-    nop [19]
-    ; [delay=41]
-.wrap
 
-% c-sdk {
-void vga_sync_program_init(PIO pio, uint sm, uint offset, uint vsync_pin, uint hsync_pin) {
-    pio_gpio_init(pio, vsync_pin);
-    pio_gpio_init(pio, hsync_pin);
-    pio_sm_set_consecutive_pindirs(pio, sm, vsync_pin, 1, true);
-    pio_sm_set_consecutive_pindirs(pio, sm, hsync_pin, 1, true);
-    pio_sm_config c = vga_sync_program_get_default_config(offset);
-    sm_config_set_set_pins(&c, hsync_pin, 1);
-    sm_config_set_out_pins(&c, vsync_pin, 1);
-    sm_config_set_clkdiv_int_frac(&c, VGA_PIXCLOCK_DIV * 16, 0);
-    sm_config_set_out_shift(&c, false, true, 1);
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-    pio_sm_init(pio, sm, offset, &c);
-}
-%}
-
-; pixel generator, 
 ; There are 4 types of lines: (all lines always assert hsync at the right time)
 ;  vsync line: during the whole line, vsync is asserted (low)
 ;  inactive line: during the whole line, color lines are black (same as vsync line)
 ;  static line: all pixels have the same color, after that black
 ;  pixel line: 40 static pixels, 240 dynamic pixels, 40 static pixels, black
 ; We run a PCLOCK, and generate 1 pixel per two cycles. Allowing for 320 pixels per line.
-.program vga_pixel
-    out y 8 ; Get the value 240 into y. We never change it after this.
+.program vga
+.side_set 1 ; HBlank as sideset pin.
+    out y   32               side 1 ; Get the value 240 into y. We never change it after this.
+    out isr 32               side 1 ; Get the value ??? into isr. We never change it after this.
 .wrap_target
-done:
-    irq wait VGA_IRQ_START_LINE ; wait from a signal from the sync generator.
+start: ; We are still in the back portion of a line, get the data we need for the next line.
     ; [delay=0]
-    out x 2 ; get the type of line.
-    jmp x-- skip  [13]
-    ; [delay=15] ; We get signaled 15 cycles to early, so we need to delay to sync up.
+    out x 8                  side 1 ; get the type of line.
+    jmp x-- blankLine        side 1 ; type != 0, blank line with or without VBLANK
+    ; type = 0, pixel data line
+    nop                      side 1
+    set pins 1               side 1 ; end vblank, if there was a VBLANK active
+    ; [delay=4] make sure back porch is finished.
 
-    out pins 6  [31]; write the pins for the first 40 pixels
-    nop         [31]
-    mov x y     [15] ; get the value 240 into x, we write 241 pixels, last pixel should be the value for the last 40 pixels.
+    out pins 8  [15]         side 1 ; write the pins for the first 40 pixels
+    nop         [15]         side 1 
+    nop         [15]         side 1 
+    nop         [15]         side 1 
+    mov x y     [15]         side 1 ; get the value 240 into x, we write 241 pixels, last pixel should be the value for the last 40 pixels.
     ; [delay=80]
 pixelLoop:
-    out pins 8 ; write a pixel
-    jmp x-- pixelLoop
-    
+    out pins 8               side 1 ; write a pixel
+    jmp x-- pixelLoop        side 1
+
     ; We get here with the first pixel of the trailing static pixels written, so just delay and clear the pixels.
-    nop [31]
-    nop [31]
-    nop [13]
+    set x 3 [13]             side 1
+trailingPixelsLoop:
+    jmp x-- trailingPixelsLoop [15] side 1
     ; [delay=78]
-    mov pins null ; goto black.
+startFront:
+    mov pins null [15]       side 1 ; goto black, start of the front
+    ; [delay=16] ;end of front, start of hsync
+    set x 4 [15]             side 0
+hsyncLoop:
+    jmp x-- hsyncLoop [15]   side 0
+    ; [delay=96] ;end of hsync, start of back
+    nop [15]                 side 1
+    nop [15]                 side 1
+    nop [11]                 side 1
+    ; [delay=48-start_cycles=4]
 .wrap
-skip:
-    out null 6
-    jmp done
+
+blankLine:
+    jmp x-- vblankLine       side 1 ; type = 2+, blank line with VBLANK
+    mov x isr [1]            side 1 ; We need 1 extra cycle to match length with the other line options, and so the pixel data starts after this
+blankLineLoop:
+    jmp x-- blankLineLoop    side 1
+    jmp startFront           side 1
+    ; [delay=640]
+
+vblankLine:
+    set pins 0               side 1 ; assert VBLANK, after this instruction the pixel data starts.
+    mov x isr                side 1
+vblankLineLoop:
+    jmp x-- vblankLineLoop   side 1
+    jmp startFront           side 1
+    ; [delay=640]
+
 
 % c-sdk {
-void vga_pixel_program_init(PIO pio, uint sm, uint offset, uint pin) {
+void vga_program_init(PIO pio, uint sm, uint offset, uint vblank_pin, uint hblank_pin, uint color_pin_start) {
+    pio_gpio_init(pio, vblank_pin);
+    pio_gpio_init(pio, hblank_pin);
     for(uint n=0; n<6; n++)
-        pio_gpio_init(pio, pin + n);
-    pio_sm_set_consecutive_pindirs(pio, sm, pin, 6, true);
-    pio_sm_config c = vga_pixel_program_get_default_config(offset);
-    sm_config_set_out_pins(&c, pin, 6);
+        pio_gpio_init(pio, color_pin_start + n);
+    pio_sm_set_consecutive_pindirs(pio, sm, vblank_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, hblank_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, color_pin_start, 6, true);
+    pio_sm_config c = vga_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, color_pin_start, 6);
+    sm_config_set_set_pins(&c, vblank_pin, 1);
+    sm_config_set_sideset_pins(&c, hblank_pin);
     sm_config_set_clkdiv_int_frac(&c, VGA_PIXCLOCK_DIV, 0);
     sm_config_set_out_shift(&c, false, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
     pio_sm_init(pio, sm, offset, &c);
     pio->txf[sm] = VGA_PIXELS;
+    pio->txf[sm] = 640 - 3;
 }
 %}
