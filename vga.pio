@@ -69,7 +69,8 @@ hsyncLoop:
 
 blankLine:
     jmp x-- vblankLine       side 1 ; type = 2+, blank line with VBLANK
-    mov x isr [1]            side 1 ; We need 1 extra cycle to match length with the other line options, and so the pixel data starts after this
+    set pins 1               side 1 ; release VBLANK
+    mov x isr                side 1 ; We need 1 extra cycle to match length with the other line options, and so the pixel data starts after this
 blankLineLoop:
     jmp x-- blankLineLoop    side 1
     jmp startFront           side 1
