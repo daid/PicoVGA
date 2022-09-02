@@ -8,49 +8,63 @@
 #include "vga.pio.h"
 
 
-uint active_buffer = 0;
+volatile uint active_buffer = 0;
 uint8_t line_buffers[2][VGA_BUFFER_SIZE];
 uint8_t vblank_buffer[VGA_FRONT_LINE_COUNT + VGA_SYNC_LINE_COUNT + VGA_BACK_LINE_COUNT];
-int line_nr = 0;
+volatile int line_nr = 0;
 uint vblank_timing = 0;
+int repeat_line;
 
 uint dma_channel;
 void dma_interrupt()
 {
     dma_channel_acknowledge_irq0(dma_channel);
 
-    line_nr++;
-    if (line_nr == VGA_VIDEO_LINE_COUNT)
-    {
-        static uint last_vblank_time;
-        uint vblank_time = time_us_32();
-        vblank_timing = vblank_time - last_vblank_time;
-        last_vblank_time = vblank_time;
-        //End of visual data, transfer the blanking info.
-        line_nr = 0;
-        dma_channel_set_trans_count(dma_channel, sizeof(vblank_buffer), false);
-        dma_channel_set_read_addr(dma_channel, vblank_buffer, true);
-        return;
+    if (repeat_line) {
+        repeat_line -= 1;
+    } else {
+        if (line_nr == VGA_VIDEO_LINE_COUNT/2 - 1)
+        {
+            static uint last_vblank_time;
+            uint vblank_time = time_us_32();
+            vblank_timing = vblank_time - last_vblank_time;
+            last_vblank_time = vblank_time;
+            //End of visual data, transfer the blanking info.
+            line_nr = 0;
+            dma_channel_set_trans_count(dma_channel, sizeof(vblank_buffer), false);
+            dma_channel_set_read_addr(dma_channel, vblank_buffer, true);
+            return;
+        }
+        active_buffer ^= 1;
+        line_nr++;
+        repeat_line = 1;
     }
-    active_buffer ^= 1;
-
     //Prepare a new dma transfer
     dma_channel_set_trans_count(dma_channel, VGA_BUFFER_SIZE, false);
     dma_channel_set_read_addr(dma_channel, line_buffers[active_buffer], true);
 }
 
+uint8_t rng()
+{
+	static uint8_t s = 0xAA, a = 0;
+	s^=s<<3;
+        s^=s>>5;
+        s^=a++>>2;
+        return s;
+}
+
 int main() {
     stdio_init_all();
-    while(!stdio_usb_connected()) tight_loop_contents();
+    //while(!stdio_usb_connected()) tight_loop_contents();
     sleep_ms(500);
-    
+
     uint vga_program_offset = pio_add_program(pio0, &vga_program);
 
-    vga_program_init(pio0, 0, vga_program_offset, 0, 1, 2);
+    vga_program_init(pio0, 0, vga_program_offset, 1, 0, 2);
 
     line_buffers[0][0] = line_buffers[1][0] = 0; // pixel data line
-    line_buffers[0][1] = line_buffers[1][1] = 0x3F; // first 40 pixels
-    line_buffers[0][VGA_PIXELS+2] = line_buffers[1][VGA_PIXELS+2] = 0x3F; // last 40 pixels
+    line_buffers[0][1] = line_buffers[1][1] = 0x15; // first 40 pixels
+    line_buffers[0][VGA_PIXELS+2] = line_buffers[1][VGA_PIXELS+2] = 0x15; // last 40 pixels
     for(int n=2; n<VGA_PIXELS+2; n++)
         line_buffers[0][n] = line_buffers[1][n] = n;
     for(int n=0; n<VGA_FRONT_LINE_COUNT; n++)
@@ -76,8 +90,21 @@ int main() {
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, true);
+int done_line = 0;
     while(true)
     {
+	if (done_line != line_nr)
+	{
+	    done_line = line_nr;
+            auto buf = line_buffers[active_buffer ^ 1];
+	    if (done_line < 20 || done_line >= 220)
+                for(int n=0; n<240; n++)
+                    buf[n+2] = 0x15;
+            else
+                for(int n=0; n<240; n++)
+                    buf[n+2] = rng();
+	}
+/*
         sleep_ms(500);
         gpio_put(PICO_DEFAULT_LED_PIN, 1);
         sleep_ms(500);
@@ -86,6 +113,7 @@ int main() {
         printf("%p %p\n", pio0->flevel, pio0->fdebug);
         pio0->fdebug = pio0->fdebug;
         printf("%p %p\n", pio0->sm[0].instr, pio0->sm[0].addr - vga_program_offset);
+*/
     }
     return 0;
 }
